@@ -283,7 +283,9 @@ def extract_frontmatter(text):
 # --- hardcoded_secret ------------------------------------------------
 
 SECRET_PREFIX_RE = re.compile(
-    r"(sk-[A-Za-z0-9]{10,}"
+    r"(sk[-_](?:live_|test_|proj-)?[A-Za-z0-9]{10,}"
+    r"|rk_live_[A-Za-z0-9]{10,}"
+    r"|pk_live_[A-Za-z0-9]{10,}"
     r"|ghp_[A-Za-z0-9]{20,}"
     r"|gho_[A-Za-z0-9]{20,}"
     r"|github_pat_[A-Za-z0-9_]{20,}"
@@ -291,14 +293,32 @@ SECRET_PREFIX_RE = re.compile(
     r"|ASIA[0-9A-Z]{12,}"
     r"|xox[baprs]-[A-Za-z0-9-]{10,}"
     r"|hooks\.slack\.com/services/[A-Za-z0-9/]{10,}"
+    r"|discord(?:app)?\.com/api/webhooks/[0-9]{10,}/[A-Za-z0-9_\-]{10,}"
     r"|-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"
     r"|AIza[0-9A-Za-z\-_]{20,})"
 )
 
 SECRET_KEY_LINE_RE = re.compile(
     r"(?im)^\s*[\"']?(api[_-]?key|apikey|secret(?:[_-]?key)?|access[_-]?key|"
-    r"private[_-]?key|webhook[_-]?url|auth[_-]?token|bearer[_-]?token|token|"
-    r"password|passwd|client[_-]?secret)[\"']?\s*[:=]\s*[\"']?([^\s\"'#]{8,})"
+    r"access[_-]?token|id[_-]?token|refresh[_-]?token|private[_-]?key|"
+    r"webhook[_-]?url|webhook[_-]?secret|auth[_-]?token|bearer[_-]?token|token|"
+    r"password|passwd|pwd|client[_-]?secret|signing[_-]?secret|"
+    r"encryption[_-]?key|session[_-]?secret|db[_-]?password|"
+    r"database[_-]?url|conn(?:ection)?[_-]?str(?:ing)?|credentials?)"
+    r"[\"']?\s*[:=]\s*[\"']?([^\s\"'#]{8,})"
+)
+
+# Connection strings / URLs with an embedded username:password, e.g.
+# postgres://user:S3cr3t@host/db — treated as a hardcoded secret regardless
+# of the surrounding variable name.
+CONN_STRING_SECRET_RE = re.compile(
+    r"(?i)\b[a-z][a-z0-9+.\-]{1,15}://[^\s:@/\"']+:([^\s@\"']{6,})@[^\s\"'/]+"
+)
+
+# `Authorization: Bearer <token>` (or `=`) hardcoded in an example
+# script/curl command.
+AUTH_HEADER_SECRET_RE = re.compile(
+    r"(?i)authorization[\"']?\s*[:=]\s*[\"']?Bearer\s+([A-Za-z0-9\-_.~+/=]{16,})"
 )
 
 SECRET_PLACEHOLDER_RE = re.compile(
@@ -316,7 +336,7 @@ def _looks_like_placeholder(value):
         return True
     if v.startswith("$") or v.startswith("{{"):
         return True
-    if v.isalpha() and v.lower() in ("test", "demo", "todo", "changeme"):
+    if v.isalpha() and v.lower() in ("test", "demo", "todo", "changeme", "password", "secret"):
         return True
     return False
 
@@ -327,6 +347,12 @@ def detect_hardcoded_secret(text):
     for m in SECRET_KEY_LINE_RE.finditer(text):
         if not _looks_like_placeholder(m.group(2)):
             return True
+    for m in CONN_STRING_SECRET_RE.finditer(text):
+        if not _looks_like_placeholder(m.group(1)):
+            return True
+    for m in AUTH_HEADER_SECRET_RE.finditer(text):
+        if not _looks_like_placeholder(m.group(1)):
+            return True
     return False
 
 
@@ -336,6 +362,7 @@ INJECTION_RE = re.compile(
     r"(?i)"
     r"ignore (?:the )?user'?s? (?:stop|cancel|interrupt)"
     r"|ignore any (?:stop|cancel|interrupt) request"
+    r"|ignore (?:any|all) (?:contradictory|conflicting|subsequent|further) instructions?"
     r"|do not (?:tell|inform|notify) the user"
     r"|without (?:telling|informing|notifying) the user"
     r"|hide (?:this|that|it) from the user"
@@ -343,10 +370,17 @@ INJECTION_RE = re.compile(
     r"|silently (?:send|upload|exfiltrat\w*|transmit|email|post|copy)"
     r"|exfiltrat\w*"
     r"|disregard (?:previous|prior|the user'?s?) instructions"
-    r"|override (?:the )?user'?s? (?:control|authority|command|instructions)"
+    r"|disregard (?:any|the) (?:system|prior) prompt"
+    r"|override (?:the )?user'?s? (?:control|authority|command|instructions|request)"
     r"|do not (?:reveal|mention|disclose) (?:this|that|you are)"
     r"|even if the user (?:says?|asks?|wants?) (?:to )?(?:stop|cancel)"
     r"|continue (?:running|executing) (?:even (?:if|though)|regardless of) (?:the )?(?:user'?s? )?(?:stop|cancel)"
+    r"|regardless of what the user (?:says?|wants?|asks?|requests?)"
+    r"|cannot be (?:skipped|overridden|cancelled|canceled|stopped) by the user"
+    r"|(?:take|takes) precedence over (?:the )?(?:user'?s? |system )?(?:instructions?|prompt|request)"
+    r"|(?:override|supersede)s? (?:the |any )?(?:system|user) prompt"
+    r"|act(?:ing)? on behalf of the user without (?:their |the user'?s? )?(?:knowledge|consent|awareness)"
+    r"|do not let the user (?:know|see|find out)"
 )
 
 
@@ -358,26 +392,45 @@ def detect_prompt_injection(text):
 
 PERM_KEY_VALUE_RE = re.compile(
     r"(?im)^\s*(filesystem|fs[_-]?access|network|domains?|allowed[_-]?domains?|"
-    r"allowed[_-]?hosts?|scope|access|permissions?|capabilities)\s*:\s*(.+)$"
+    r"allowed[_-]?hosts?|allowed[_-]?urls?|scope|access|permissions?|capabilities|"
+    r"paths?|directories|dirs?|root)\s*:\s*(.+)$"
 )
 
-BROAD_VALUE_RE = re.compile(
-    r"(?i)(\*|\ball\b|\bany\b|\bfull[_-]?disk\b|\bunrestricted\b|\beverything\b|"
-    r"\bread[_-]?write\b.*\bfilesystem\b|^/\s*$|^\*$)"
+BROAD_VALUE_WORD_RE = re.compile(
+    r"(?i)\ball\b|\bany\b|\bfull[_-]?disk\b|\bunrestricted\b|\beverything\b|"
+    r"\bglobal\b|\bread[_-]?write\b.*\bfilesystem\b"
 )
+
+
+def _value_is_broad(value):
+    v = value.strip()
+    if BROAD_VALUE_WORD_RE.search(v):
+        return True
+    # Strip brackets/quotes/whitespace and split on commas so that values
+    # like `["/"]`, `"/"`, or `/, /etc` are still recognized as granting
+    # the filesystem root (or a wildcard) rather than only a bare `/` line.
+    parts = [p.strip().strip("\"'") for p in re.split(r"[\[\],]", v)]
+    parts = [p for p in parts if p]
+    for p in parts:
+        if p in ("/", "*", "**", "~"):
+            return True
+    return False
+
 
 BROAD_PERM_TEXT_RE = re.compile(
-    r"(?i)\b(?:full|entire|whole) (?:filesystem|disk|file ?system)\b"
-    r"|\baccess to (?:any|all) domains?\b"
-    r"|\begress to any domain\b"
-    r"|\bread(?:/|\s+and\s+)write access to (?:the )?(?:entire|whole|full)?\s*(?:filesystem|disk)\b"
+    r"(?i)\b(?:full|entire|whole)\s+(?:filesystem|disk|file ?system|home\s+directory)\b"
+    r"|\baccess to (?:any|all)\s+(?:domains?|hosts?|urls?|websites?|external\s+services?)\b"
+    r"|\begress to any\s+(?:domain|host)\b"
+    r"|\bconnect to any\s+(?:server|host|domain|url|website)\b"
+    r"|\bread(?:/|\s+and\s+)write access to (?:the )?(?:entire|whole|full)?\s*(?:filesystem|disk|home\s+directory)\b"
+    r"|\ball files (?:on|in) (?:the )?(?:system|disk|computer|machine)\b"
+    r"|\bunrestricted (?:network|filesystem|file ?system|internet) access\b"
 )
 
 
 def detect_excessive_permissions(text, frontmatter):
     for m in PERM_KEY_VALUE_RE.finditer(frontmatter):
-        value = m.group(2)
-        if BROAD_VALUE_RE.search(value):
+        if _value_is_broad(m.group(2)):
             return True
     if BROAD_PERM_TEXT_RE.search(text):
         return True
@@ -390,11 +443,18 @@ HAS_AUTHOR_RE = re.compile(r"(?im)^\s*author\s*:\s*\S")
 HAS_VERSION_RE = re.compile(r"(?im)^\s*version\s*:\s*\S")
 HAS_CHANGELOG_RE = re.compile(r"(?im)^\s*changelog\s*:\s*\S|^#+\s*changelog\b")
 
+_SILENT_WORDS = (
+    r"(?:silently|quietly|invisibly|behind the scenes|unnoticed|"
+    r"without (?:telling|informing|notifying|surfacing|disclosing|showing|alerting)"
+    r"(?: (?:the )?(?:user|reviewer))?)"
+)
+_METADATA_WORDS = r"(?:version(?: number| field)?|changelog|metadata|provenance)"
+_ACTION_WORDS = r"(?:update|rewrite|overwrite|bump|increment|change|modify|edit|regenerat\w*|alter)"
+
 SILENT_METADATA_REWRITE_RE = re.compile(
-    r"(?i)(?:silently|without (?:telling|informing|notifying|surfacing)"
-    r"(?: the (?:user|reviewer))?)\W+(?:[a-z]+\W+){0,6}?(version|changelog|metadata)"
-    r"|(?:update|rewrite|overwrite|bump|increment)\W+(?:[a-z]+\W+){0,6}?(version|changelog)"
-    r"\W+(?:[a-z]+\W+){0,6}?without (?:telling|informing|notifying|surfacing)"
+    rf"(?i)(?:{_SILENT_WORDS}(?:[^.]{{0,80}}){_METADATA_WORDS})"
+    rf"|(?:{_METADATA_WORDS}(?:[^.]{{0,80}}){_SILENT_WORDS})"
+    rf"|(?:{_ACTION_WORDS}(?:[^.]{{0,60}}){_METADATA_WORDS}(?:[^.]{{0,60}}){_SILENT_WORDS})"
 )
 
 
