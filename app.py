@@ -94,10 +94,21 @@ BASE64_BLOB_RE = re.compile(r"[A-Za-z0-9+/]{16,}={0,2}")
 
 CREDENTIALS_WORD_RE = re.compile(r"""[^\s'"`|;&<>(){}]*credentials\.env""")
 
+# Matches a redirect target that may be a double-quoted string (with
+# backslash escapes), a single-quoted string, or a bare whitespace-delimited
+# token. The quoted alternatives are tried first (regex alternation is
+# ordered) so that targets containing spaces, e.g.
+#     > "/home/agent/workspace/output/my file.txt"
+# are captured in full instead of being truncated at the first internal
+# space -- which previously left a mangled, quote-prefixed fragment that no
+# longer matched either allowed root and caused a legitimate in-bounds
+# write to be blocked.
+_TARGET_TOKEN = r'(?:"((?:[^"\\]|\\.)*)"|\'([^\']*)\'|([^\s|;&]+))'
+
 REDIRECT_TARGET_RES = [
-    re.compile(r">>?\s*([^\s|;&]+)"),
-    re.compile(r"\btee\b(?:\s+-a)?\s+([^\s|;&]+)"),
-    re.compile(r"\bdd\b[^|;&]*\bof=([^\s|;&]+)"),
+    re.compile(r">>?\s*" + _TARGET_TOKEN),
+    re.compile(r"\btee\b(?:\s+-a)?\s+" + _TARGET_TOKEN),
+    re.compile(r"\bdd\b[^|;&]*\bof=" + _TARGET_TOKEN),
 ]
 
 CD_RE = re.compile(r"^\s*cd(?:\s+([^\s;&|]+))?\s*$")
@@ -169,7 +180,9 @@ def scan_command_text(raw_text):
 
         for pattern in REDIRECT_TARGET_RES:
             for m in pattern.finditer(seg):
-                target = m.group(1)
+                target = next((g for g in m.groups() if g is not None), None)
+                if not target:
+                    continue
                 resolved = normalize_path_token(target, cwd)
                 if is_write_target_outside_allowed(resolved):
                     return True, "This command writes outside the allowed output directory, which is never permitted."
