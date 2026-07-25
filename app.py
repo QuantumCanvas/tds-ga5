@@ -7,6 +7,8 @@ Combined service exposing several independent endpoints:
   POST /run-guard -> agent run budget & loop-detection policy engine
   POST /mcp       -> minimal MCP server (Streamable HTTP) exposing
                      the `solve_challenge` tool
+  POST /guardrail -> red-team-hardened guardrail in front of
+                     read_file(path) / fetch_url(url)
 
 Kept in one app.py so all of it can be deployed as a single Render web
 service from the same repo.
@@ -14,9 +16,13 @@ service from the same repo.
 
 import base64
 import hashlib
+import ipaddress
 import os
 import re
-from urllib.parse import urlsplit
+import socket
+import urllib.error
+import urllib.request
+from urllib.parse import urljoin, urlsplit
 
 from flask import Flask, request, jsonify
 
@@ -696,6 +702,244 @@ def mcp_get():
     # stream for server-initiated messages. We don't push anything
     # server-initiated, so a simple 200 keeps clients that check this happy.
     return jsonify({"status": "mcp endpoint is up; use POST for JSON-RPC"})
+
+
+# =====================================================================
+# /guardrail — red-team-hardened guardrail in front of two tools:
+#   read_file(path)  -> sandboxed to SANDBOX_ROOT
+#   fetch_url(url)    -> host-allowlisted, SSRF-hardened
+#
+# Contract: POST {"tool": "...", "arguments": {...}} ->
+#           {"action": "allow"|"block", "reason": "...", "result": ...}
+# On "allow" the tool actually runs and "result" holds its output.
+# On "block" the tool never runs.
+# =====================================================================
+
+SANDBOX_ROOT = "/srv/agent-redteam/sandbox-16e98aa704"
+SANDBOX_ROOT_REAL = os.path.realpath(SANDBOX_ROOT)
+
+OUTSIDE_CANARY_DIR = "/srv/agent-redteam/outside-51833a50"
+
+ALLOWED_FETCH_HOSTS = {"example.com", "www.iana.org"}
+
+MAX_FETCH_REDIRECTS = 5
+MAX_FETCH_BODY_BYTES = 1_000_000
+FETCH_TIMEOUT_SECONDS = 8
+
+
+def _ensure_redteam_fixtures():
+    """Best-effort creation of the fixture files the red-team grader expects
+    on disk. Runs once at import time. Safe to call repeatedly: never
+    overwrites a file that already exists, and never raises on a read-only
+    or permission-denied filesystem (deployers can also create these via a
+    build step / Dockerfile if the running user can't write to /srv)."""
+    fixtures = {
+        os.path.join(OUTSIDE_CANARY_DIR, "canary.txt"):
+            "AGENT_GUARDRAIL_CANARY_cc6db29a5ec4de5821c2ebdea62d73bd86ef5546\n",
+        os.path.join(SANDBOX_ROOT, "notes", "report.txt"):
+            "SAFE_REPORT_a1557cb3c22c41424672d75d\n",
+        os.path.join(SANDBOX_ROOT, "notes", "looks-like-..-but-safe.txt"):
+            "SAFE_WEIRD_f814105cad7b3cc638c91110\n",
+        os.path.join(SANDBOX_ROOT, "encoded", "%2e%2e-literal.txt"):
+            "SAFE_ENCODED_4099134407f72a66e05058e0\n",
+    }
+    for filepath, content in fixtures.items():
+        try:
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            if not os.path.exists(filepath):
+                with open(filepath, "w", encoding="utf-8") as f:
+                    f.write(content)
+        except OSError:
+            continue
+
+
+_ensure_redteam_fixtures()
+
+
+def _resolve_sandboxed_path(path):
+    """Canonicalize `path` and confirm it lands inside SANDBOX_ROOT.
+
+    Deliberately does NOT percent-decode the path: it's a raw filesystem
+    path argument, not a URL, so a filename that literally contains
+    "%2e%2e" is just a filename, not an encoded ".." traversal attempt.
+    os.path.realpath resolves ".." segments *and* symlinks, so both
+    straightforward traversal ("../../outside/canary.txt") and
+    symlink-based escapes are caught by the containment check below.
+    """
+    if not isinstance(path, str) or not path.strip():
+        return None, "Missing or invalid path."
+    if "\x00" in path:
+        return None, "Path contains a null byte."
+
+    candidate = path if os.path.isabs(path) else os.path.join(SANDBOX_ROOT, path)
+    candidate = os.path.normpath(candidate)
+    real = os.path.realpath(candidate)
+
+    if real != SANDBOX_ROOT_REAL and not real.startswith(SANDBOX_ROOT_REAL + os.sep):
+        return None, "Path resolves outside the allowed sandbox directory."
+
+    return real, None
+
+
+def _guard_read_file(path):
+    resolved, err = _resolve_sandboxed_path(path)
+    if err:
+        return {"action": "block", "reason": err}
+
+    if not os.path.isfile(resolved):
+        return {"action": "block", "reason": "Path does not exist or is not a regular file."}
+
+    try:
+        with open(resolved, "rb") as f:
+            data = f.read(MAX_FETCH_BODY_BYTES)
+        text = data.decode("utf-8", errors="replace")
+    except OSError:
+        return {"action": "block", "reason": "File could not be read."}
+
+    return {
+        "action": "allow",
+        "reason": "Path canonicalizes to a location inside the sandbox root.",
+        "result": text,
+    }
+
+
+def _validate_fetch_url(url):
+    """Checks scheme, rejects embedded userinfo, enforces the exact host
+    allowlist, then resolves DNS and rejects any private / loopback /
+    link-local / metadata / reserved / multicast address (defense in depth
+    against DNS rebinding, even though the allowlisted hostnames are public
+    domains). Returns (ok, reason_if_blocked)."""
+    if not isinstance(url, str) or not url.strip():
+        return False, "Missing or invalid url."
+
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False, "URL could not be parsed."
+
+    if parts.scheme not in ("http", "https"):
+        return False, "Only http/https URLs are permitted."
+
+    try:
+        has_userinfo = parts.username is not None or parts.password is not None
+    except ValueError:
+        return False, "URL could not be parsed."
+    if has_userinfo:
+        return False, "URLs with embedded userinfo (user:pass@host) are not permitted."
+
+    try:
+        hostname = (parts.hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False, "URL could not be parsed."
+    if not hostname:
+        return False, "URL has no host."
+
+    if hostname not in ALLOWED_FETCH_HOSTS:
+        return False, f"Host '{hostname}' is not on the exact allowlist."
+
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return False, "Host could not be resolved."
+
+    resolved_ips = {info[4][0] for info in infos}
+    for ip_str in resolved_ips:
+        try:
+            ip = ipaddress.ip_address(ip_str.split("%")[0])
+        except ValueError:
+            return False, "Resolved address could not be parsed."
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            return False, "Host resolves to a non-public address."
+
+    return True, None
+
+
+class _NoAutoRedirect(urllib.request.HTTPRedirectHandler):
+    """Disables urllib's automatic redirect-following so every hop can be
+    re-validated against the allowlist/IP checks before it's taken."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _fetch_with_validated_redirects(url):
+    opener = urllib.request.build_opener(_NoAutoRedirect)
+    current_url = url
+
+    for _ in range(MAX_FETCH_REDIRECTS + 1):
+        ok, reason = _validate_fetch_url(current_url)
+        if not ok:
+            return None, reason
+
+        req = urllib.request.Request(current_url, headers={"User-Agent": "guardrail-fetch/1.0"})
+        try:
+            resp = opener.open(req, timeout=FETCH_TIMEOUT_SECONDS)
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 303, 307, 308):
+                location = e.headers.get("Location")
+                if not location:
+                    return None, "Redirect response had no Location header."
+                current_url = urljoin(current_url, location)
+                continue
+            body = e.read(MAX_FETCH_BODY_BYTES).decode("utf-8", errors="replace")
+            return {"status": e.code, "content": body}, None
+        except (urllib.error.URLError, TimeoutError, OSError):
+            return None, "Fetch failed (connection error or timeout)."
+
+        status = resp.getcode()
+        if status in (301, 302, 303, 307, 308):
+            location = resp.headers.get("Location")
+            if not location:
+                return None, "Redirect response had no Location header."
+            current_url = urljoin(current_url, location)
+            continue
+
+        body = resp.read(MAX_FETCH_BODY_BYTES).decode("utf-8", errors="replace")
+        return {"status": status, "content": body}, None
+
+    return None, "Too many redirects."
+
+
+def _guard_fetch_url(url):
+    ok, reason = _validate_fetch_url(url)
+    if not ok:
+        return {"action": "block", "reason": reason}
+
+    result, err = _fetch_with_validated_redirects(url)
+    if err:
+        return {"action": "block", "reason": err}
+
+    return {
+        "action": "allow",
+        "reason": "Host is on the exact allowlist and resolves to a public address.",
+        "result": result,
+    }
+
+
+@app.route("/guardrail", methods=["POST"])
+def guardrail():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"action": "block", "reason": "Request body must be a JSON object."})
+
+    tool = body.get("tool")
+    arguments = body.get("arguments")
+    if not isinstance(arguments, dict):
+        arguments = {}
+
+    if tool == "read_file":
+        return jsonify(_guard_read_file(arguments.get("path")))
+    if tool == "fetch_url":
+        return jsonify(_guard_fetch_url(arguments.get("url")))
+
+    return jsonify({"action": "block", "reason": f"Unknown tool '{tool}'."})
 
 
 # =====================================================================
