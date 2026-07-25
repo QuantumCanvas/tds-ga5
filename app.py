@@ -29,10 +29,8 @@ def compute_charge(old_price, new_price, days_remaining, days_in_actual_month, s
     price_delta = new_price - old_price
 
     if spec == "v1":
-        # Legacy rule: fixed 30-day divisor, no matter the real month length.
         divisor = 30
     elif spec == "v2":
-        # Corrected rule: use the actual number of days in the billing month.
         divisor = days_in_actual_month
     else:
         raise ValueError(f"Unknown spec '{spec}', expected one of {sorted(VALID_SPECS)}")
@@ -75,33 +73,37 @@ def prorate():
 
 
 # =====================================================================
-# /check — agent guardrail hook
+# /check — agent guardrail hook (v2: fixed legitimate-read over-block
+# and bash-redirection write-traversal under-block)
 # =====================================================================
 
 AGENT_HOME = "/home/agent"
 AGENT_WORKDIR = "/home/agent/workspace"
 PROTECTED_FILE = "/home/agent/credentials.env"
 
-# Both spellings are accepted as the allowed write root, since the spec
-# names it "/workspace/output/" while the working directory is
-# "/home/agent/workspace" -- we treat either as the intended sandbox.
 ALLOWED_WRITE_ROOTS = [
-    "/home/agent/workspace/output",
-    "/workspace/output",
+    os.path.normpath("/home/agent/workspace/output"),
+    os.path.normpath("/workspace/output"),
 ]
 
 ALLOWED_HOSTS = {"huggingface.co", "raw.githubusercontent.com"}
 
 PRIV_ESC_RE = re.compile(r"(?<![\w-])(sudo|doas|su)(?![\w-])")
 
-# Matches a base64-looking blob of reasonable length (avoids false
-# positives on short words).
 BASE64_BLOB_RE = re.compile(r"[A-Za-z0-9+/]{16,}={0,2}")
+
+CREDENTIALS_WORD_RE = re.compile(r"""[^\s'"`|;&<>(){}]*credentials\.env""")
+
+REDIRECT_TARGET_RES = [
+    re.compile(r">>?\s*([^\s|;&]+)"),
+    re.compile(r"\btee\b(?:\s+-a)?\s+([^\s|;&]+)"),
+    re.compile(r"\bdd\b[^|;&]*\bof=([^\s|;&]+)"),
+]
+
+CD_RE = re.compile(r"^\s*cd(?:\s+([^\s;&|]+))?\s*$")
 
 
 def try_base64_decode_all(text):
-    """Find base64-looking substrings in text and return their decoded
-    forms (best-effort; ignores anything that fails to decode as utf-8)."""
     decoded_chunks = []
     for match in BASE64_BLOB_RE.finditer(text):
         candidate = match.group(0)
@@ -116,52 +118,84 @@ def try_base64_decode_all(text):
     return decoded_chunks
 
 
+def strip_quotes(token):
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in ("'", '"'):
+        return token[1:-1]
+    return token
+
+
 def normalize_path_token(token, cwd):
-    """Resolve a raw path-like token (possibly using ~, $HOME, or relative
-    traversal) against cwd, returning a normalized absolute path."""
-    t = token.strip()
+    t = strip_quotes(token.strip())
+    t = t.replace("\\", "/")
     if t.startswith("~"):
         t = AGENT_HOME + t[1:]
-    t = t.replace("$HOME", AGENT_HOME).replace("${HOME}", AGENT_HOME)
+    t = re.sub(r"\$\{?HOME\}?", AGENT_HOME, t)
     if not t.startswith("/"):
         t = os.path.join(cwd, t)
     return os.path.normpath(t)
 
 
-CREDENTIALS_TOKEN_RE = re.compile(
-    r"(?:~|\$\{?HOME\}?|(?:\.\./)+|\./|/[\w./-]*|[\w.-]*)?"
-    r"credentials\.env"
-)
+def split_segments(command):
+    return [seg for seg in re.split(r"&&|\|\||[;|\n]", command) if seg.strip()]
 
 
-def references_protected_file(raw_command):
-    """Return True if the (possibly obfuscated / base64-wrapped) command
-    resolves to reading the protected credentials file."""
-    texts_to_scan = [raw_command]
-    texts_to_scan.extend(try_base64_decode_all(raw_command))
+def is_write_target_outside_allowed(resolved_path):
+    for root in ALLOWED_WRITE_ROOTS:
+        if resolved_path == root or resolved_path.startswith(root + os.sep):
+            return False
+    return True
 
-    for text in texts_to_scan:
-        for match in CREDENTIALS_TOKEN_RE.finditer(text):
-            token = match.group(0)
-            resolved = normalize_path_token(token, AGENT_WORKDIR)
+
+def scan_command_text(raw_text):
+    cwd = AGENT_WORKDIR
+
+    for segment in split_segments(raw_text):
+        seg = segment.strip()
+
+        cd_match = CD_RE.match(seg)
+        if cd_match:
+            target = cd_match.group(1)
+            if not target or target == "~":
+                cwd = AGENT_HOME
+            else:
+                cwd = normalize_path_token(target, cwd)
+            continue
+
+        for word_match in CREDENTIALS_WORD_RE.finditer(seg):
+            token = word_match.group(0)
+            resolved = normalize_path_token(token, cwd)
             if resolved == PROTECTED_FILE:
-                return True
-        if "credentials.env" in text:
-            return True
-    return False
+                return True, "This command attempts to read the protected credentials file, which is never permitted."
+
+        for pattern in REDIRECT_TARGET_RES:
+            for m in pattern.finditer(seg):
+                target = m.group(1)
+                resolved = normalize_path_token(target, cwd)
+                if is_write_target_outside_allowed(resolved):
+                    return True, "This command writes outside the allowed output directory, which is never permitted."
+
+    return False, None
 
 
 def check_bash(command):
     if not isinstance(command, str) or not command.strip():
         return "block", "Empty or invalid command."
 
-    if references_protected_file(command):
-        return "block", "This command attempts to read the protected credentials file, which is never permitted."
-
     if PRIV_ESC_RE.search(command):
         return "block", "Privilege escalation (sudo/su/doas) is not permitted for this agent."
 
-    return "allow", "Command does not touch the protected secret file or attempt privilege escalation."
+    blocked, reason = scan_command_text(command)
+    if blocked:
+        return "block", reason
+
+    for decoded in try_base64_decode_all(command):
+        if PRIV_ESC_RE.search(decoded):
+            return "block", "Privilege escalation (sudo/su/doas) is not permitted for this agent."
+        blocked, reason = scan_command_text(decoded)
+        if blocked:
+            return "block", reason
+
+    return "allow", "Command does not touch the protected secret file, attempt privilege escalation, or write outside the allowed output directory."
 
 
 def check_write_file(path):
@@ -170,12 +204,10 @@ def check_write_file(path):
 
     resolved = normalize_path_token(path, AGENT_WORKDIR)
 
-    for root in ALLOWED_WRITE_ROOTS:
-        root_norm = os.path.normpath(root)
-        if resolved == root_norm or resolved.startswith(root_norm + os.sep):
-            return "allow", "Write target is inside the allowed output directory."
+    if is_write_target_outside_allowed(resolved):
+        return "block", "Writes are only permitted inside the designated output directory."
 
-    return "block", "Writes are only permitted inside the designated output directory."
+    return "allow", "Write target is inside the allowed output directory."
 
 
 def check_http_request(url):
