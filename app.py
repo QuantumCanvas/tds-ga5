@@ -1,14 +1,19 @@
 """
-Combined service exposing two independent endpoints:
+Combined service exposing several independent endpoints:
 
-  POST /prorate  -> proration calculator (spec v1 legacy / v2 corrected)
-  POST /check    -> deterministic pre-tool-call guardrail policy engine
+  POST /prorate   -> proration calculator (spec v1 legacy / v2 corrected)
+  POST /check     -> deterministic pre-tool-call guardrail policy engine
+  POST /scan      -> agent skill safety scanner
+  POST /run-guard -> agent run budget & loop-detection policy engine
+  POST /mcp       -> minimal MCP server (Streamable HTTP) exposing
+                     the `solve_challenge` tool
 
-Kept in one app.py so both can be deployed as a single Render web service
-from the same repo.
+Kept in one app.py so all of it can be deployed as a single Render web
+service from the same repo.
 """
 
 import base64
+import hashlib
 import os
 import re
 from urllib.parse import urlsplit
@@ -94,15 +99,6 @@ BASE64_BLOB_RE = re.compile(r"[A-Za-z0-9+/]{16,}={0,2}")
 
 CREDENTIALS_WORD_RE = re.compile(r"""[^\s'"`|;&<>(){}]*credentials\.env""")
 
-# Matches a redirect target that may be a double-quoted string (with
-# backslash escapes), a single-quoted string, or a bare whitespace-delimited
-# token. The quoted alternatives are tried first (regex alternation is
-# ordered) so that targets containing spaces, e.g.
-#     > "/home/agent/workspace/output/my file.txt"
-# are captured in full instead of being truncated at the first internal
-# space -- which previously left a mangled, quote-prefixed fragment that no
-# longer matched either allowed root and caused a legitimate in-bounds
-# write to be blocked.
 _TARGET_TOKEN = r'(?:"((?:[^"\\]|\\.)*)"|\'([^\']*)\'|([^\s|;&]+))'
 
 REDIRECT_TARGET_RES = [
@@ -265,11 +261,6 @@ def check():
 
 # =====================================================================
 # /scan — agent skill safety scanner
-#
-# Heuristic, regex-based scanner for shared "agent skill" markdown files
-# (YAML frontmatter + instructions). No LLM call — fast and deterministic,
-# tuned to favor precision (false positives on the two guaranteed-clean
-# probe files are penalized harder than a missed detection).
 # =====================================================================
 
 FRONTMATTER_RE = re.compile(r"^\s*---\s*\r?\n(.*?)\r?\n---\s*(?:\r?\n|$)", re.DOTALL)
@@ -279,8 +270,6 @@ def extract_frontmatter(text):
     m = FRONTMATTER_RE.match(text)
     return m.group(1) if m else ""
 
-
-# --- hardcoded_secret ------------------------------------------------
 
 SECRET_PREFIX_RE = re.compile(
     r"(sk[-_](?:live_|test_|proj-)?[A-Za-z0-9]{10,}"
@@ -308,15 +297,10 @@ SECRET_KEY_LINE_RE = re.compile(
     r"[\"']?\s*[:=]\s*[\"']?([^\s\"'#]{8,})"
 )
 
-# Connection strings / URLs with an embedded username:password, e.g.
-# postgres://user:S3cr3t@host/db — treated as a hardcoded secret regardless
-# of the surrounding variable name.
 CONN_STRING_SECRET_RE = re.compile(
     r"(?i)\b[a-z][a-z0-9+.\-]{1,15}://[^\s:@/\"']+:([^\s@\"']{6,})@[^\s\"'/]+"
 )
 
-# `Authorization: Bearer <token>` (or `=`) hardcoded in an example
-# script/curl command.
 AUTH_HEADER_SECRET_RE = re.compile(
     r"(?i)authorization[\"']?\s*[:=]\s*[\"']?Bearer\s+([A-Za-z0-9\-_.~+/=]{16,})"
 )
@@ -356,8 +340,6 @@ def detect_hardcoded_secret(text):
     return False
 
 
-# --- prompt_injection --------------------------------------------------
-
 INJECTION_RE = re.compile(
     r"(?i)"
     r"ignore (?:the )?user'?s? (?:stop|cancel|interrupt)"
@@ -388,8 +370,6 @@ def detect_prompt_injection(text):
     return bool(INJECTION_RE.search(text))
 
 
-# --- excessive_permissions ---------------------------------------------
-
 PERM_KEY_VALUE_RE = re.compile(
     r"(?im)^\s*(filesystem|fs[_-]?access|network|domains?|allowed[_-]?domains?|"
     r"allowed[_-]?hosts?|allowed[_-]?urls?|scope|access|permissions?|capabilities|"
@@ -406,9 +386,6 @@ def _value_is_broad(value):
     v = value.strip()
     if BROAD_VALUE_WORD_RE.search(v):
         return True
-    # Strip brackets/quotes/whitespace and split on commas so that values
-    # like `["/"]`, `"/"`, or `/, /etc` are still recognized as granting
-    # the filesystem root (or a wildcard) rather than only a bare `/` line.
     parts = [p.strip().strip("\"'") for p in re.split(r"[\[\],]", v)]
     parts = [p for p in parts if p]
     for p in parts:
@@ -436,8 +413,6 @@ def detect_excessive_permissions(text, frontmatter):
         return True
     return False
 
-
-# --- unclear_provenance --------------------------------------------------
 
 HAS_AUTHOR_RE = re.compile(r"(?im)^\s*author\s*:\s*\S")
 HAS_VERSION_RE = re.compile(r"(?im)^\s*version\s*:\s*\S")
@@ -494,22 +469,12 @@ def scan():
 
 # =====================================================================
 # /run-guard — agent run budget & loop-detection policy engine
-#
-# NOTE: the task spec's example URL uses path "/check", but that path is
-# already taken in this file by the pre-tool-call guardrail endpoint above.
-# This is exposed at "/run-guard" instead — point the grader at
-# https://<your-deployed-domain>/run-guard.
 # =====================================================================
 
 _WHITESPACE_RE = re.compile(r"\s+")
 
 
 def _normalize_args(value):
-    """Recursively drop the client_ts tracing field and collapse
-    whitespace-only differences inside string values, so cosmetically
-    different args (reordered keys, changed tracing id, extra/irregular
-    whitespace) compare equal. Key order never matters for dict equality
-    in Python, so no explicit sort is needed."""
     if isinstance(value, dict):
         return {
             k: _normalize_args(v)
@@ -532,8 +497,6 @@ def _same_call(step_a, step_b):
 
 
 def _trailing_identical_run_length(steps):
-    """How many trailing steps (ending at the most recent step) are all
-    the same tool with functionally identical args."""
     if not steps:
         return 0
     last = steps[-1]
@@ -547,8 +510,6 @@ def _trailing_identical_run_length(steps):
 
 
 def _trailing_two_step_cycle(steps):
-    """True if the last 6 steps form a strict A,B,A,B,A,B pattern (same
-    call repeating every other step, two distinct calls involved)."""
     if len(steps) < 6:
         return False
     a1, b1, a2, b2, a3, b3 = steps[-6:]
@@ -608,6 +569,133 @@ def run_guard():
         "decision": "continue",
         "reason": "Under budget and no repeated-call loop detected in the trailing steps."
     })
+
+
+# =====================================================================
+# /mcp — minimal MCP server (Streamable HTTP transport)
+#
+# Exposes exactly one tool, `solve_challenge`, with an empty input
+# schema. On every tools/call it reads X-Exam-Challenge from the raw
+# HTTP request headers (never from the JSON-RPC body) and returns the
+# first 16 lowercase hex characters of
+#   SHA-256(f"{challenge}:{REGISTERED_EMAIL}")
+# as a single MCP text content block.
+#
+# This is a hand-rolled JSON-RPC 2.0 implementation of just the slice
+# of the MCP spec the grader needs (initialize / notifications/initialized
+# / tools/list / tools/call) so it has no dependency on an MCP SDK.
+# =====================================================================
+
+REGISTERED_EMAIL = "24f3004964@ds.study.iitm.ac.in"
+
+MCP_TOOLS = [
+    {
+        "name": "solve_challenge",
+        "description": "Solves the exam challenge using the X-Exam-Challenge header from the current request.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    }
+]
+
+
+def _jsonrpc_result(req_id, result):
+    return {"jsonrpc": "2.0", "id": req_id, "result": result}
+
+
+def _jsonrpc_error(req_id, code, message):
+    return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
+
+
+def _handle_initialize(req_id, params):
+    # Echo back whatever protocolVersion the client asked for so we stay
+    # compatible with whichever MCP spec revision the grader's client speaks.
+    client_version = (params or {}).get("protocolVersion", "2024-11-05")
+    return _jsonrpc_result(req_id, {
+        "protocolVersion": client_version,
+        "capabilities": {
+            "tools": {}
+        },
+        "serverInfo": {
+            "name": "solve-challenge-mcp-server",
+            "version": "1.0.0",
+        },
+    })
+
+
+def _handle_tools_list(req_id):
+    return _jsonrpc_result(req_id, {"tools": MCP_TOOLS})
+
+
+def _handle_tools_call(req_id, params):
+    name = (params or {}).get("name")
+    if name != "solve_challenge":
+        return _jsonrpc_error(req_id, -32602, f"Unknown tool '{name}'")
+
+    challenge = request.headers.get("X-Exam-Challenge", "")
+    if not challenge:
+        return _jsonrpc_error(req_id, -32602, "Missing X-Exam-Challenge header.")
+
+    digest = hashlib.sha256(f"{challenge}:{REGISTERED_EMAIL}".encode("utf-8")).hexdigest()
+    answer = digest[:16]
+
+    return _jsonrpc_result(req_id, {
+        "content": [
+            {"type": "text", "text": answer}
+        ],
+        "isError": False,
+    })
+
+
+def _dispatch_single(msg):
+    if not isinstance(msg, dict):
+        return None
+
+    method = msg.get("method")
+    req_id = msg.get("id")
+    params = msg.get("params")
+    is_notification = "id" not in msg  # JSON-RPC notifications carry no id
+
+    if method == "initialize":
+        return _handle_initialize(req_id, params)
+    if method == "notifications/initialized":
+        return None  # notification: no response body per JSON-RPC/MCP spec
+    if method == "tools/list":
+        return _handle_tools_list(req_id)
+    if method == "tools/call":
+        return _handle_tools_call(req_id, params)
+
+    if is_notification:
+        return None
+    return _jsonrpc_error(req_id, -32601, f"Method not found: {method}")
+
+
+@app.route("/mcp", methods=["POST"])
+def mcp():
+    body = request.get_json(silent=True)
+    if body is None:
+        return jsonify(_jsonrpc_error(None, -32700, "Parse error: request body must be JSON")), 400
+
+    if isinstance(body, list):
+        responses = [r for r in (_dispatch_single(m) for m in body) if r is not None]
+        if not responses:
+            return "", 202
+        return jsonify(responses)
+
+    response = _dispatch_single(body)
+    if response is None:
+        # Pure notification (e.g. notifications/initialized) -> no body.
+        return "", 202
+    return jsonify(response)
+
+
+@app.route("/mcp", methods=["GET"])
+def mcp_get():
+    # Some MCP clients probe the endpoint with GET first, or open an SSE
+    # stream for server-initiated messages. We don't push anything
+    # server-initiated, so a simple 200 keeps clients that check this happy.
+    return jsonify({"status": "mcp endpoint is up; use POST for JSON-RPC"})
 
 
 # =====================================================================
