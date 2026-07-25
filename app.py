@@ -493,6 +493,124 @@ def scan():
 
 
 # =====================================================================
+# /run-guard — agent run budget & loop-detection policy engine
+#
+# NOTE: the task spec's example URL uses path "/check", but that path is
+# already taken in this file by the pre-tool-call guardrail endpoint above.
+# This is exposed at "/run-guard" instead — point the grader at
+# https://<your-deployed-domain>/run-guard.
+# =====================================================================
+
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _normalize_args(value):
+    """Recursively drop the client_ts tracing field and collapse
+    whitespace-only differences inside string values, so cosmetically
+    different args (reordered keys, changed tracing id, extra/irregular
+    whitespace) compare equal. Key order never matters for dict equality
+    in Python, so no explicit sort is needed."""
+    if isinstance(value, dict):
+        return {
+            k: _normalize_args(v)
+            for k, v in value.items()
+            if k != "client_ts"
+        }
+    if isinstance(value, list):
+        return [_normalize_args(v) for v in value]
+    if isinstance(value, str):
+        return _WHITESPACE_RE.sub(" ", value).strip()
+    return value
+
+
+def _same_call(step_a, step_b):
+    if not isinstance(step_a, dict) or not isinstance(step_b, dict):
+        return False
+    if step_a.get("tool") != step_b.get("tool"):
+        return False
+    return _normalize_args(step_a.get("args", {})) == _normalize_args(step_b.get("args", {}))
+
+
+def _trailing_identical_run_length(steps):
+    """How many trailing steps (ending at the most recent step) are all
+    the same tool with functionally identical args."""
+    if not steps:
+        return 0
+    last = steps[-1]
+    count = 1
+    for s in reversed(steps[:-1]):
+        if _same_call(s, last):
+            count += 1
+        else:
+            break
+    return count
+
+
+def _trailing_two_step_cycle(steps):
+    """True if the last 6 steps form a strict A,B,A,B,A,B pattern (same
+    call repeating every other step, two distinct calls involved)."""
+    if len(steps) < 6:
+        return False
+    a1, b1, a2, b2, a3, b3 = steps[-6:]
+    if not (_same_call(a1, a2) and _same_call(a2, a3)):
+        return False
+    if not (_same_call(b1, b2) and _same_call(b2, b3)):
+        return False
+    if _same_call(a1, b1):
+        return False
+    return True
+
+
+@app.route("/run-guard", methods=["POST"])
+def run_guard():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"decision": "halt", "reason": "Request body must be a JSON object."})
+
+    budget_tokens = body.get("budget_tokens")
+    steps = body.get("steps")
+
+    if not isinstance(budget_tokens, (int, float)) or isinstance(budget_tokens, bool):
+        return jsonify({"decision": "halt", "reason": "Missing or invalid budget_tokens."})
+    if not isinstance(steps, list):
+        return jsonify({"decision": "halt", "reason": "Missing or invalid steps."})
+
+    if not steps:
+        return jsonify({"decision": "continue", "reason": "No steps taken yet; nothing to halt on."})
+
+    total_tokens = 0
+    for s in steps:
+        if isinstance(s, dict):
+            used = s.get("tokens_used", 0)
+            if isinstance(used, (int, float)) and not isinstance(used, bool):
+                total_tokens += used
+
+    if total_tokens >= budget_tokens:
+        return jsonify({
+            "decision": "halt",
+            "reason": f"Cumulative tokens_used ({total_tokens}) has reached the budget ({budget_tokens})."
+        })
+
+    run_len = _trailing_identical_run_length(steps)
+    if run_len >= 3:
+        return jsonify({
+            "decision": "halt",
+            "reason": f"Same tool called with functionally identical arguments {run_len} times in a row."
+        })
+
+    if _trailing_two_step_cycle(steps):
+        return jsonify({
+            "decision": "halt",
+            "reason": "Trailing steps show a repeating 2-step call cycle (A, B, A, B, A, B)."
+        })
+
+    return jsonify({
+        "decision": "continue",
+        "reason": "Under budget and no repeated-call loop detected in the trailing steps."
+    })
+
+
+# =====================================================================
 # Shared health check
 # =====================================================================
 
