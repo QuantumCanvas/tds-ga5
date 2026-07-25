@@ -756,6 +756,10 @@ def _ensure_redteam_fixtures():
 _ensure_redteam_fixtures()
 
 
+def _is_contained(real_path):
+    return real_path == SANDBOX_ROOT_REAL or real_path.startswith(SANDBOX_ROOT_REAL + os.sep)
+
+
 def _resolve_sandboxed_path(path):
     """Canonicalize `path` and confirm it lands inside SANDBOX_ROOT.
 
@@ -765,20 +769,35 @@ def _resolve_sandboxed_path(path):
     os.path.realpath resolves ".." segments *and* symlinks, so both
     straightforward traversal ("../../outside/canary.txt") and
     symlink-based escapes are caught by the containment check below.
+
+    A path starting with "/" is ambiguous: it could be a real OS-absolute
+    path, or it could be the tool's own *virtual* root (i.e. "/notes/x.txt"
+    meaning "x.txt inside the sandbox's notes/ dir", the way a chrooted
+    path would work). We try the literal OS-absolute interpretation first;
+    if that doesn't land inside the sandbox, we retry treating it as
+    sandbox-root-relative. Containment is enforced identically either way,
+    so this only widens which benign spellings resolve -- it never permits
+    an actual escape, since a path only "succeeds" here if its final
+    canonical form is provably inside SANDBOX_ROOT.
     """
     if not isinstance(path, str) or not path.strip():
         return None, "Missing or invalid path."
     if "\x00" in path:
         return None, "Path contains a null byte."
 
-    candidate = path if os.path.isabs(path) else os.path.join(SANDBOX_ROOT, path)
-    candidate = os.path.normpath(candidate)
-    real = os.path.realpath(candidate)
+    candidates = []
+    if os.path.isabs(path):
+        candidates.append(path)
+        candidates.append(os.path.join(SANDBOX_ROOT, path.lstrip("/")))
+    else:
+        candidates.append(os.path.join(SANDBOX_ROOT, path))
 
-    if real != SANDBOX_ROOT_REAL and not real.startswith(SANDBOX_ROOT_REAL + os.sep):
-        return None, "Path resolves outside the allowed sandbox directory."
+    for candidate in candidates:
+        real = os.path.realpath(os.path.normpath(candidate))
+        if _is_contained(real):
+            return real, None
 
-    return real, None
+    return None, "Path resolves outside the allowed sandbox directory."
 
 
 def _guard_read_file(path):
