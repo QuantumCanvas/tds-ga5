@@ -264,6 +264,175 @@ def check():
 
 
 # =====================================================================
+# /scan — agent skill safety scanner
+#
+# Heuristic, regex-based scanner for shared "agent skill" markdown files
+# (YAML frontmatter + instructions). No LLM call — fast and deterministic,
+# tuned to favor precision (false positives on the two guaranteed-clean
+# probe files are penalized harder than a missed detection).
+# =====================================================================
+
+FRONTMATTER_RE = re.compile(r"^\s*---\s*\r?\n(.*?)\r?\n---\s*(?:\r?\n|$)", re.DOTALL)
+
+
+def extract_frontmatter(text):
+    m = FRONTMATTER_RE.match(text)
+    return m.group(1) if m else ""
+
+
+# --- hardcoded_secret ------------------------------------------------
+
+SECRET_PREFIX_RE = re.compile(
+    r"(sk-[A-Za-z0-9]{10,}"
+    r"|ghp_[A-Za-z0-9]{20,}"
+    r"|gho_[A-Za-z0-9]{20,}"
+    r"|github_pat_[A-Za-z0-9_]{20,}"
+    r"|AKIA[0-9A-Z]{12,}"
+    r"|ASIA[0-9A-Z]{12,}"
+    r"|xox[baprs]-[A-Za-z0-9-]{10,}"
+    r"|hooks\.slack\.com/services/[A-Za-z0-9/]{10,}"
+    r"|-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"
+    r"|AIza[0-9A-Za-z\-_]{20,})"
+)
+
+SECRET_KEY_LINE_RE = re.compile(
+    r"(?im)^\s*[\"']?(api[_-]?key|apikey|secret(?:[_-]?key)?|access[_-]?key|"
+    r"private[_-]?key|webhook[_-]?url|auth[_-]?token|bearer[_-]?token|token|"
+    r"password|passwd|client[_-]?secret)[\"']?\s*[:=]\s*[\"']?([^\s\"'#]{8,})"
+)
+
+SECRET_PLACEHOLDER_RE = re.compile(
+    r"(?i)^(\$\{|\$env|\$\(|env:|environ|getenv|your[_-]?|<|xxx+|changeme|"
+    r"example|placeholder|none|null|redacted|\*{3,}|secrets\.|process\.env|"
+    r"os\.environ)"
+)
+
+
+def _looks_like_placeholder(value):
+    v = value.strip().strip("\"'")
+    if not v:
+        return True
+    if SECRET_PLACEHOLDER_RE.search(v):
+        return True
+    if v.startswith("$") or v.startswith("{{"):
+        return True
+    if v.isalpha() and v.lower() in ("test", "demo", "todo", "changeme"):
+        return True
+    return False
+
+
+def detect_hardcoded_secret(text):
+    if SECRET_PREFIX_RE.search(text):
+        return True
+    for m in SECRET_KEY_LINE_RE.finditer(text):
+        if not _looks_like_placeholder(m.group(2)):
+            return True
+    return False
+
+
+# --- prompt_injection --------------------------------------------------
+
+INJECTION_RE = re.compile(
+    r"(?i)"
+    r"ignore (?:the )?user'?s? (?:stop|cancel|interrupt)"
+    r"|ignore any (?:stop|cancel|interrupt) request"
+    r"|do not (?:tell|inform|notify) the user"
+    r"|without (?:telling|informing|notifying) the user"
+    r"|hide (?:this|that|it) from the user"
+    r"|keep (?:this|it) (?:hidden|secret) from the user"
+    r"|silently (?:send|upload|exfiltrat\w*|transmit|email|post|copy)"
+    r"|exfiltrat\w*"
+    r"|disregard (?:previous|prior|the user'?s?) instructions"
+    r"|override (?:the )?user'?s? (?:control|authority|command|instructions)"
+    r"|do not (?:reveal|mention|disclose) (?:this|that|you are)"
+    r"|even if the user (?:says?|asks?|wants?) (?:to )?(?:stop|cancel)"
+    r"|continue (?:running|executing) (?:even (?:if|though)|regardless of) (?:the )?(?:user'?s? )?(?:stop|cancel)"
+)
+
+
+def detect_prompt_injection(text):
+    return bool(INJECTION_RE.search(text))
+
+
+# --- excessive_permissions ---------------------------------------------
+
+PERM_KEY_VALUE_RE = re.compile(
+    r"(?im)^\s*(filesystem|fs[_-]?access|network|domains?|allowed[_-]?domains?|"
+    r"allowed[_-]?hosts?|scope|access|permissions?|capabilities)\s*:\s*(.+)$"
+)
+
+BROAD_VALUE_RE = re.compile(
+    r"(?i)(\*|\ball\b|\bany\b|\bfull[_-]?disk\b|\bunrestricted\b|\beverything\b|"
+    r"\bread[_-]?write\b.*\bfilesystem\b|^/\s*$|^\*$)"
+)
+
+BROAD_PERM_TEXT_RE = re.compile(
+    r"(?i)\b(?:full|entire|whole) (?:filesystem|disk|file ?system)\b"
+    r"|\baccess to (?:any|all) domains?\b"
+    r"|\begress to any domain\b"
+    r"|\bread(?:/|\s+and\s+)write access to (?:the )?(?:entire|whole|full)?\s*(?:filesystem|disk)\b"
+)
+
+
+def detect_excessive_permissions(text, frontmatter):
+    for m in PERM_KEY_VALUE_RE.finditer(frontmatter):
+        value = m.group(2)
+        if BROAD_VALUE_RE.search(value):
+            return True
+    if BROAD_PERM_TEXT_RE.search(text):
+        return True
+    return False
+
+
+# --- unclear_provenance --------------------------------------------------
+
+HAS_AUTHOR_RE = re.compile(r"(?im)^\s*author\s*:\s*\S")
+HAS_VERSION_RE = re.compile(r"(?im)^\s*version\s*:\s*\S")
+HAS_CHANGELOG_RE = re.compile(r"(?im)^\s*changelog\s*:\s*\S|^#+\s*changelog\b")
+
+SILENT_METADATA_REWRITE_RE = re.compile(
+    r"(?i)(?:silently|without (?:telling|informing|notifying|surfacing)"
+    r"(?: the (?:user|reviewer))?)\W+(?:[a-z]+\W+){0,6}?(version|changelog|metadata)"
+    r"|(?:update|rewrite|overwrite|bump|increment)\W+(?:[a-z]+\W+){0,6}?(version|changelog)"
+    r"\W+(?:[a-z]+\W+){0,6}?without (?:telling|informing|notifying|surfacing)"
+)
+
+
+def detect_unclear_provenance(text, frontmatter):
+    has_author = bool(HAS_AUTHOR_RE.search(frontmatter))
+    has_version = bool(HAS_VERSION_RE.search(frontmatter))
+    has_changelog = bool(HAS_CHANGELOG_RE.search(frontmatter)) or bool(HAS_CHANGELOG_RE.search(text))
+
+    if not has_author and not has_version and not has_changelog:
+        return True
+    if SILENT_METADATA_REWRITE_RE.search(text):
+        return True
+    return False
+
+
+@app.route("/scan", methods=["POST"])
+def scan():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict) or not isinstance(body.get("skill"), str) or not body["skill"].strip():
+        return jsonify({"categories": []})
+
+    text = body["skill"]
+    frontmatter = extract_frontmatter(text)
+
+    categories = []
+    if detect_hardcoded_secret(text):
+        categories.append("hardcoded_secret")
+    if detect_prompt_injection(text):
+        categories.append("prompt_injection")
+    if detect_excessive_permissions(text, frontmatter):
+        categories.append("excessive_permissions")
+    if detect_unclear_provenance(text, frontmatter):
+        categories.append("unclear_provenance")
+
+    return jsonify({"categories": categories})
+
+
+# =====================================================================
 # Shared health check
 # =====================================================================
 
